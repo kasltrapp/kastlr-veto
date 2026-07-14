@@ -214,6 +214,11 @@ router.get('/sessions/token/:token', async (req, res) => {
 /**
  * Perform a coinflip to determine ban/pick order. Server-generated,
  * logged as its own ledger entry — never decided client-side.
+ *
+ * The winning team is recorded as the action's `actor` (not 'system') so
+ * the ledger is self-describing: anyone reading the action history later
+ * (including the engine itself, for bo2's decider side-pick attribution)
+ * can see who won without cross-referencing the sessions table.
  */
 router.post('/sessions/:id/coinflip', async (req, res) => {
   try {
@@ -222,7 +227,7 @@ router.post('/sessions/:id/coinflip', async (req, res) => {
       return res.status(400).json({ error: 'Coinflip already performed for this session' });
     }
     const winner = Math.random() < 0.5 ? 'team_a' : 'team_b';
-    await appendAction(session, { actor: 'system', actionType: 'coinflip', map: null, side: null });
+    await appendAction(session, { actor: winner, actionType: 'coinflip', map: null, side: null });
 
     const { data: updated, error } = await supabase
       .from('veto_sessions')
@@ -240,9 +245,33 @@ router.post('/sessions/:id/coinflip', async (req, res) => {
 });
 
 /**
- * Submit a ban/pick/side-pick action. Server is sole authority: validates
- * the token maps to the correct actor and that the action is legal for the
- * current engine state before writing anything.
+ * Auto-advance through any decider steps that don't require human input.
+ * A decider map is "auto-locked" the instant only one map (or, for bo2,
+ * one of the final two) remains — no captain chooses it, so it's written
+ * immediately rather than waiting on a request that will never come.
+ * Stops as soon as the next state needs a real human action (a side-pick,
+ * or the veto is complete).
+ */
+async function autoAdvanceDeciders(session, ruleset, mapPool, structure) {
+  let actions = await loadActions(session.id);
+  let state = vetoEngine.resolveNextStep(ruleset, mapPool, actions, structure);
+  let guard = 0;
+  while (state.pendingDecider && guard++ < 10) {
+    const deciderAction = await appendAction(session, {
+      actor: 'system', actionType: 'decider', map: state.map, side: null,
+    });
+    actions = [...actions, deciderAction];
+    state = vetoEngine.resolveNextStep(ruleset, mapPool, actions, structure);
+  }
+  return { actions, state };
+}
+
+/**
+ * Submit a ban, pick, or side-pick. Server is sole authority: resolves the
+ * current engine state itself to determine what kind of input is expected
+ * right now, validates the token maps to the correct actor for that input,
+ * writes it, then auto-advances through any decider(s) that follow before
+ * returning the resulting state.
  */
 router.post('/sessions/:id/action', async (req, res) => {
   try {
@@ -266,36 +295,58 @@ router.post('/sessions/:id/action', async (req, res) => {
     const next = vetoEngine.resolveNextStep(session.ruleset, poolRow.maps, actions, session.veto_structure);
 
     if (next.pendingDecider) {
-      return res.status(400).json({ error: 'Awaiting decider confirmation, not a captain action' });
-    }
-    if (next.nextAction.actor !== actor) {
-      return res.status(403).json({ error: `Not your turn — waiting on ${next.nextAction.actor}` });
-    }
-    if (!poolRow.maps.includes(map)) {
-      return res.status(400).json({ error: 'Invalid map for this pool' });
+      return res.status(409).json({ error: 'Decider is auto-resolving, please refresh' });
     }
 
+    let newAction;
     const steamId = actor === 'team_a' ? session.team_a_steam_id : session.team_b_steam_id;
-    const newAction = await appendAction(session, {
-      actor, actionType: next.nextAction.action, map, side: null, steamId,
-    });
 
-    const afterActions = [...actions, newAction];
-    const afterState = vetoEngine.resolveNextStep(session.ruleset, poolRow.maps, afterActions, session.veto_structure);
+    if (next.pendingSidePick) {
+      if (next.sidePickBy !== actor) {
+        return res.status(403).json({ error: `Not your side to pick — waiting on ${next.sidePickBy}` });
+      }
+      if (side !== 'ct' && side !== 't') {
+        return res.status(400).json({ error: 'side must be "ct" or "t"' });
+      }
+      newAction = await appendAction(session, {
+        actor, actionType: 'side_pick', map: next.map, side, steamId,
+      });
+    } else {
+      if (next.nextAction.actor !== actor) {
+        return res.status(403).json({ error: `Not your turn — waiting on ${next.nextAction.actor}` });
+      }
+      if (!poolRow.maps.includes(map)) {
+        return res.status(400).json({ error: 'Invalid map for this pool' });
+      }
+      newAction = await appendAction(session, {
+        actor, actionType: next.nextAction.action, map, side: null, steamId,
+      });
+    }
 
-    const updates = {
-      current_turn: afterState.pendingDecider || afterState.complete
-        ? 'complete'
-        : afterState.nextAction.actor,
-    };
-    if (afterState.pendingDecider || afterState.complete) {
+    const { actions: finalActions, state: afterState } = await autoAdvanceDeciders(
+      session, session.ruleset, poolRow.maps, session.veto_structure
+    );
+
+    let currentTurn;
+    if (afterState.complete) {
+      currentTurn = 'complete';
+    } else if (afterState.pendingSidePick) {
+      currentTurn = afterState.sidePickBy;
+    } else {
+      currentTurn = afterState.nextAction.actor;
+    }
+
+    const updates = { current_turn: currentTurn };
+    if (afterState.complete) {
       updates.status = 'complete';
       updates.completed_at = new Date().toISOString();
     }
     await supabase.from('veto_sessions').update(updates).eq('id', session.id);
 
-    req.app.get('io').to(`veto:${session.id}`).emit('veto:update', { type: 'action', action: newAction, nextState: afterState });
-    res.json({ action: newAction, nextState: afterState });
+    req.app.get('io').to(`veto:${session.id}`).emit('veto:update', {
+      type: 'action', action: newAction, finalActions, nextState: afterState,
+    });
+    res.json({ action: newAction, actions: finalActions, nextState: afterState });
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
