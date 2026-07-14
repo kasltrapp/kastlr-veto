@@ -19,6 +19,7 @@ const supabase = require('./supabaseClient');
 const vetoEngine = require('./vetoEngine');
 const handoffToken = require('./handoffToken');
 const { generateSessionTokens } = require('./vetoTokens');
+const { loadSession, loadActions, appendAction, autoAdvanceDeciders, computeSessionUpdates } = require('./vetoCore');
 
 const router = express.Router();
 
@@ -35,65 +36,11 @@ async function getActivePool(game) {
   return data;
 }
 
-async function loadSession(sessionId) {
-  const { data, error } = await supabase
-    .from('veto_sessions')
-    .select('*')
-    .eq('id', sessionId)
-    .single();
-  if (error || !data) throw new Error('Session not found');
-  return data;
-}
-
-async function loadActions(sessionId) {
-  const { data, error } = await supabase
-    .from('veto_actions')
-    .select('*')
-    .eq('session_id', sessionId)
-    .order('sequence_no', { ascending: true });
-  if (error) throw new Error('Failed to load session actions');
-  return data || [];
-}
-
 function resolveActorFromToken(session, token) {
   if (token === session.team_a_token) return 'team_a';
   if (token === session.team_b_token) return 'team_b';
   if (token === session.spectator_token) return 'spectator';
   return null;
-}
-
-async function appendAction(session, { actor, actionType, map, side, steamId }) {
-  const actions = await loadActions(session.id);
-  const sequenceNo = actions.length;
-  const prevActionHash = actions.length ? actions[actions.length - 1].action_hash : null;
-  const actionHash = vetoEngine.computeActionHash({
-    sessionId: session.id,
-    sequenceNo,
-    actor,
-    actionType,
-    map,
-    side,
-    prevActionHash,
-  });
-
-  const { data, error } = await supabase
-    .from('veto_actions')
-    .insert({
-      session_id: session.id,
-      sequence_no: sequenceNo,
-      actor,
-      action_type: actionType,
-      map: map || null,
-      side: side || null,
-      steam_id: steamId || null,
-      prev_action_hash: prevActionHash,
-      action_hash: actionHash,
-    })
-    .select()
-    .single();
-
-  if (error) throw new Error('Failed to write veto action');
-  return data;
 }
 
 // --- Routes ------------------------------------------------------------
@@ -231,7 +178,12 @@ router.post('/sessions/:id/coinflip', async (req, res) => {
 
     const { data: updated, error } = await supabase
       .from('veto_sessions')
-      .update({ coinflip_winner: winner, current_turn: winner, status: 'active' })
+      .update({
+        coinflip_winner: winner,
+        current_turn: winner,
+        status: 'active',
+        turn_deadline_at: new Date(Date.now() + session.timer_seconds * 1000).toISOString(),
+      })
       .eq('id', session.id)
       .select()
       .single();
@@ -243,28 +195,6 @@ router.post('/sessions/:id/coinflip', async (req, res) => {
     res.status(400).json({ error: err.message });
   }
 });
-
-/**
- * Auto-advance through any decider steps that don't require human input.
- * A decider map is "auto-locked" the instant only one map (or, for bo2,
- * one of the final two) remains — no captain chooses it, so it's written
- * immediately rather than waiting on a request that will never come.
- * Stops as soon as the next state needs a real human action (a side-pick,
- * or the veto is complete).
- */
-async function autoAdvanceDeciders(session, ruleset, mapPool, structure) {
-  let actions = await loadActions(session.id);
-  let state = vetoEngine.resolveNextStep(ruleset, mapPool, actions, structure);
-  let guard = 0;
-  while (state.pendingDecider && guard++ < 10) {
-    const deciderAction = await appendAction(session, {
-      actor: 'system', actionType: 'decider', map: state.map, side: null,
-    });
-    actions = [...actions, deciderAction];
-    state = vetoEngine.resolveNextStep(ruleset, mapPool, actions, structure);
-  }
-  return { actions, state };
-}
 
 /**
  * Submit a ban, pick, or side-pick. Server is sole authority: resolves the
@@ -327,20 +257,7 @@ router.post('/sessions/:id/action', async (req, res) => {
       session, session.ruleset, poolRow.maps, session.veto_structure
     );
 
-    let currentTurn;
-    if (afterState.complete) {
-      currentTurn = 'complete';
-    } else if (afterState.pendingSidePick) {
-      currentTurn = afterState.sidePickBy;
-    } else {
-      currentTurn = afterState.nextAction.actor;
-    }
-
-    const updates = { current_turn: currentTurn };
-    if (afterState.complete) {
-      updates.status = 'complete';
-      updates.completed_at = new Date().toISOString();
-    }
+    const updates = computeSessionUpdates(afterState, session.timer_seconds);
     await supabase.from('veto_sessions').update(updates).eq('id', session.id);
 
     req.app.get('io').to(`veto:${session.id}`).emit('veto:update', {
