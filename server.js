@@ -23,6 +23,7 @@ const { Server: SocketIOServer } = require('socket.io');
 
 const vetoRoutes = require('./vetoRoutes');
 const attachVetoSockets = require('./vetoSockets');
+const { startTimeoutSweep } = require('./vetoTimeoutSweep');
 
 const app = express();
 const server = http.createServer(app);
@@ -96,6 +97,7 @@ const io = new SocketIOServer(server, {
 });
 app.set('io', io);
 attachVetoSockets(io);
+startTimeoutSweep(io);
 
 const PORT = process.env.PORT || 4100;
 server.listen(PORT, () => {
