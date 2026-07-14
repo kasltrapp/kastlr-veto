@@ -193,19 +193,19 @@ router.get('/sessions/token/:token', async (req, res) => {
     if (error || !session) return res.status(404).json({ error: 'Session not found' });
 
     const role = resolveActorFromToken(session, token);
-    const pool = await supabase.from('veto_pool_templates').select('maps').eq('id', session.pool_template_id).single();
+    const { data: poolRow } = await supabase.from('veto_pool_templates').select('maps').eq('id', session.pool_template_id).single();
     const actions = await loadActions(session.id);
 
     let nextStep = null;
     if (session.status !== 'complete') {
       try {
-        nextStep = vetoEngine.resolveNextStep(session.ruleset, pool.data.maps, actions, session.veto_structure);
+        nextStep = vetoEngine.resolveNextStep(session.ruleset, poolRow.maps, actions, session.veto_structure);
       } catch {
         nextStep = null;
       }
     }
 
-    res.json({ session, role, actions, nextStep });
+    res.json({ session, role, actions, nextStep, pool: poolRow.maps });
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
